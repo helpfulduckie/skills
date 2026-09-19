@@ -839,10 +839,22 @@ def add_view_flag(p):
 
 def child_nodes(node, seen_ids):
     """
-    Return a node's real child branches, filtering out self-references and any
-    ancestor already on the path (the API's `options` can echo the node itself or
-    re-walk ancestors, which otherwise inflates leaf counts). `seen_ids` is the set
-    of IDs from root down to and including this node.
+    Return a node's real child branches. `seen_ids` is the set of IDs from root down
+    to and including this node.
+
+    `options` is not a child list: it is a flattened list of the node's entire
+    subtree, plus the node itself. Three things therefore have to come out of it —
+    self-references, ancestors already on the path, and *descendants of siblings*,
+    which are grandchildren or deeper rather than children.
+
+    Missing that third case double-counts a layered tree. World Time Generator
+    (`CsVRzE8kMGUh`) is three menus of five leaves; its root lists all eighteen
+    descendants, so walking them yields the fifteen leaves under the menus plus the
+    same fifteen again at root level, and `aid tree` reports thirty.
+
+    A candidate is a grandchild exactly when some other candidate's own subtree
+    contains it, which is what the second pass below tests. One level of lookup is
+    enough precisely because `options` is already flattened.
     """
     nid = node.get("id")
     kids = []
@@ -852,7 +864,16 @@ def child_nodes(node, seen_ids):
             continue
         if cid and cid != nid and cid not in seen_ids:
             kids.append(child)
-    return kids
+
+    subtrees = set()
+    for kid in kids:
+        kid_id = kid.get("id")
+        for descendant in (kid.get("options") or []):
+            did = descendant.get("id")
+            if did and did != kid_id:
+                subtrees.add(did)
+
+    return [k for k in kids if k.get("id") not in subtrees]
 
 
 def count_leaves(node, seen_ids=None):
