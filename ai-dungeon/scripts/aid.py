@@ -837,10 +837,44 @@ def add_view_flag(p):
 
 # ─── Branch Tree Helpers ─────────────────────────────────────────────────────
 
-def child_nodes(node, seen_ids):
+def index_nodes(root):
+    """
+    Map each node id to the most complete copy of that node in the response.
+
+    The query nests `options` a fixed number of levels, so a node reached near the
+    bottom of that nesting comes back truncated, with its own subtree omitted. The
+    same node also appears in the root's flattened list, shallow enough to still
+    carry its subtree — so preferring the copy with the most options gives every
+    node a populated subtree however deep it sits.
+
+    Without this, reconstruction only works as deep as the query nests. Below that a
+    truncated copy looks childless, so it is mistaken for a playable leaf and its own
+    descendants collapse up into its parent's level.
+    """
+    index, expanded = {}, set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        nid = node.get("id")
+        if not nid:
+            continue
+        known = index.get(nid)
+        if known is None or len(node.get("options") or []) > len(known.get("options") or []):
+            index[nid] = node
+        if id(node) in expanded:
+            continue
+        expanded.add(id(node))
+        for child in (node.get("options") or []):
+            if child.get("id") != nid:
+                stack.append(child)
+    return index
+
+
+def child_nodes(node, seen_ids, index=None):
     """
     Return a node's real child branches. `seen_ids` is the set of IDs from root down
-    to and including this node.
+    to and including this node; `index` comes from `index_nodes` and is what lets
+    this work below the query's nesting limit.
 
     `options` is not a child list: it is a flattened list of the node's entire
     subtree, plus the node itself. Three things therefore have to come out of it —
@@ -852,18 +886,22 @@ def child_nodes(node, seen_ids):
     descendants, so walking them yields the fifteen leaves under the menus plus the
     same fifteen again at root level, and `aid tree` reports thirty.
 
-    A candidate is a grandchild exactly when some other candidate's own subtree
-    contains it, which is what the second pass below tests. One level of lookup is
-    enough precisely because `options` is already flattened.
+    A candidate is a grandchild exactly when some other candidate's subtree contains
+    it. One level of lookup settles that at *any* depth rather than fixing one
+    generation and leaving the next broken, because each candidate's subtree is
+    itself already flattened. What would leave the next generation broken is reading
+    a truncated copy, which is why candidates are resolved through the index first.
     """
     nid = node.get("id")
-    kids = []
+    kids, seen_kids = [], set()
     for child in (node.get("options") or []):
         cid = child.get("id")
-        if child.get("deletedAt"):
+        if child.get("deletedAt") or not cid or cid == nid or cid in seen_ids:
             continue
-        if cid and cid != nid and cid not in seen_ids:
-            kids.append(child)
+        if cid in seen_kids:
+            continue
+        seen_kids.add(cid)
+        kids.append(index.get(cid, child) if index else child)
 
     subtrees = set()
     for kid in kids:
@@ -876,19 +914,21 @@ def child_nodes(node, seen_ids):
     return [k for k in kids if k.get("id") not in subtrees]
 
 
-def count_leaves(node, seen_ids=None):
+def count_leaves(node, seen_ids=None, index=None):
     """Count playable leaf branches, with path-based dedup against self/cycles."""
     if seen_ids is None:
         seen_ids = set()
+    if index is None:
+        index = index_nodes(node)
     nid = node.get("id")
     path = seen_ids | ({nid} if nid else set())
-    kids = child_nodes(node, path)
+    kids = child_nodes(node, path, index)
     if not kids:
         return 1
-    return sum(count_leaves(k, path) for k in kids)
+    return sum(count_leaves(k, path, index) for k in kids)
 
 
-def collect_leaves(node, seen_ids=None, path=None):
+def collect_leaves(node, seen_ids=None, path=None, index=None):
     """
     Return a list of (path_titles, leaf_node) for every playable leaf, with the
     same self/cycle dedup as count_leaves. For a plain scenario (no options) this
@@ -898,15 +938,17 @@ def collect_leaves(node, seen_ids=None, path=None):
         seen_ids = set()
     if path is None:
         path = []
+    if index is None:
+        index = index_nodes(node)
     nid = node.get("id")
     seen = seen_ids | ({nid} if nid else set())
     here = path + [node.get("title") or node.get("shortId") or "?"]
-    kids = child_nodes(node, seen)
+    kids = child_nodes(node, seen, index)
     if not kids:
         return [(here, node)]
     out = []
     for k in kids:
-        out.extend(collect_leaves(k, seen, here))
+        out.extend(collect_leaves(k, seen, here, index))
     return out
 
 
@@ -1688,10 +1730,12 @@ def cmd_cards(args):
     print()
 
 
-def _print_tree(node, depth=0, is_last=True, prefix="", seen_ids=None):
+def _print_tree(node, depth=0, is_last=True, prefix="", seen_ids=None, index=None):
     """Recursively print an MC scenario branch tree, with shortIds and self/cycle dedup."""
     if seen_ids is None:
         seen_ids = set()
+    if index is None:
+        index = index_nodes(node)
     nid = node.get("id")
     path = seen_ids | ({nid} if nid else set())
 
@@ -1699,7 +1743,7 @@ def _print_tree(node, depth=0, is_last=True, prefix="", seen_ids=None):
     sid = node.get("shortId") or "?"
     ntype = node.get("type") or "?"
     cards = node.get("storyCardCount", 0)
-    kids = child_nodes(node, path)
+    kids = child_nodes(node, path, index)
     is_leaf = not kids
 
     connector = "└─ " if is_last else "├─ "
@@ -1713,7 +1757,7 @@ def _print_tree(node, depth=0, is_last=True, prefix="", seen_ids=None):
 
     child_prefix = prefix + ("   " if is_last else "│  ") if depth > 0 else "  "
     for i, child in enumerate(kids):
-        _print_tree(child, depth + 1, i == len(kids) - 1, child_prefix, path)
+        _print_tree(child, depth + 1, i == len(kids) - 1, child_prefix, path, index)
 
 
 def cmd_tree(args):
@@ -1732,7 +1776,7 @@ def cmd_tree(args):
         print(json.dumps(s, indent=2, ensure_ascii=False))
         return
 
-    root_kids = child_nodes(s, {s.get("id")})
+    root_kids = child_nodes(s, {s.get("id")}, index_nodes(s))
     if not root_kids:
         print(f"\n  '{s['title']}' has no child options — it's a single scenario,")
         print(f"  not a Multiple Choice tree. Use:  {PROG} details {args.short_id}\n")
@@ -1771,7 +1815,7 @@ def cmd_export(args):
         print(f"  ✗ Scenario '{args.short_id}' not found")
         sys.exit(1)
 
-    is_mc = bool(child_nodes(root, {root.get("id")}))
+    is_mc = bool(child_nodes(root, {root.get("id")}, index_nodes(root)))
     leaves = collect_leaves(root)
     root_slug = slugify(root.get("title") or root.get("shortId"))
 

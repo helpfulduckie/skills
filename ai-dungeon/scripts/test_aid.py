@@ -14,13 +14,44 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from aid import child_nodes, count_leaves, collect_leaves  # noqa: E402
+from aid import child_nodes, count_leaves, collect_leaves, index_nodes  # noqa: E402
 
 
 def node(nid, title, options=None, **extra):
     n = {"id": nid, "shortId": nid, "title": title, "options": options or []}
     n.update(extra)
     return n
+
+
+def api_shape(tree, nest_limit=3):
+    """Render a real tree the way the API returns it.
+
+    Two behaviors matter and both are load-bearing. A node's `options` is its whole
+    flattened subtree with itself first, not its children. And the query nests
+    `options` only so far, so a copy rendered below `nest_limit` comes back with its
+    subtree omitted — which is what makes a deep tree collapse if reconstruction
+    trusts whichever copy it happens to reach first.
+
+    `tree` is (id, title, [children]).
+    """
+    def subtree_ids(spec):
+        _, _, kids = spec
+        out = []
+        for kid in kids:
+            out.append(kid)
+            out.extend(subtree_ids(kid))
+        return out
+
+    def render(spec, level):
+        nid, title, _ = spec
+        n = node(nid, title)
+        if level > nest_limit:
+            n["options"] = []          # truncated by the query's nesting limit
+            return n
+        n["options"] = [n] + [render(d, level + 1) for d in subtree_ids(spec)]
+        return n
+
+    return render(tree, 0)
 
 
 def flattened(root_id, title, menus):
@@ -83,6 +114,75 @@ class ChildNodesTests(unittest.TestCase):
 
     def test_plain_scenario_has_one_leaf(self):
         self.assertEqual(count_leaves(node("solo", "Solo")), 1)
+
+
+class DeepTreeTests(unittest.TestCase):
+    """Depth beyond the query's nesting, which is where a per-generation fix fails."""
+
+    # root > era > region > city > district > two endings. Deep enough that the
+    # query's nesting runs out partway down, which is the whole point of the case.
+    TREE = ("root", "Root", [
+        ("era", "Era", [
+            ("region", "Region", [
+                ("city", "City", [
+                    ("district", "District", [
+                        ("end1", "Ending One", []),
+                        ("end2", "Ending Two", []),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
+
+    def test_each_level_keeps_exactly_its_own_children(self):
+        root = api_shape(self.TREE)
+        index = index_nodes(root)
+
+        def only_child(n, expected):
+            kids = child_nodes(n, {n["id"]}, index)
+            self.assertEqual([k["id"] for k in kids], [expected],
+                             f"{n['id']} should have exactly {expected} beneath it")
+            return index[expected]
+
+        era = only_child(root, "era")
+        region = only_child(era, "region")
+        city = only_child(region, "city")
+        district = only_child(city, "district")
+        seen = {"root", "era", "region", "city", "district"}
+        endings = child_nodes(district, seen, index)
+        self.assertEqual(sorted(k["id"] for k in endings), ["end1", "end2"])
+
+    def test_deep_leaves_are_counted_once(self):
+        self.assertEqual(count_leaves(api_shape(self.TREE)), 2)
+
+    def test_deep_leaf_paths_keep_every_level(self):
+        paths = [p for p, _ in collect_leaves(api_shape(self.TREE))]
+        self.assertEqual(sorted(paths), [
+            ["Root", "Era", "Region", "City", "District", "Ending One"],
+            ["Root", "Era", "Region", "City", "District", "Ending Two"],
+        ])
+
+    def test_a_truncated_copy_is_not_mistaken_for_a_leaf(self):
+        root = api_shape(self.TREE)
+        parents = {"era", "region", "city", "district"}
+
+        def truncated_parents(n, found, seen):
+            if id(n) in seen:
+                return found
+            seen.add(id(n))
+            for child in n.get("options") or []:
+                if child["id"] == n["id"]:
+                    continue
+                if child["id"] in parents and not child.get("options"):
+                    found.add(child["id"])
+                truncated_parents(child, found, seen)
+            return found
+
+        found = truncated_parents(root, set(), set())
+        self.assertTrue(found, "fixture must contain a parent that arrived truncated")
+        # Those copies look childless, so anything trusting them would both count
+        # them as playable and lose everything beneath them.
+        self.assertEqual(count_leaves(root), 2)
 
 
 if __name__ == "__main__":
